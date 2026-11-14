@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Find my size — Mesur</title>
+  <link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+  <link rel="stylesheet" href="/css/app.css">
+  <style>
+    html, body { height: 100%; background: var(--card); }
+    body { overflow-y: auto; }
+    .frame { padding: 26px 24px 28px; display: flex; flex-direction: column; gap: 20px; min-height: 100%; }
+    .frame .result-size { font-size: 92px; }
+    .frame .result-hero { grid-template-columns: 1fr; gap: 14px; }
+    .frame .cmp { grid-template-columns: 1fr auto auto; font-size: 13px; }
+    .frame .cmp .tagcol { display: none; }
+    .alt { display: flex; gap: 8px; flex-wrap: wrap; }
+    .foot { margin-top: auto; display: flex; justify-content: space-between; align-items: center; gap: 10px; padding-top: 6px; }
+    .powered { font-size: 11px; letter-spacing: .12em; color: var(--faint); text-transform: uppercase; }
+  </style>
+</head>
+<body>
+  <main class="frame" id="root" aria-live="polite"></main>
+  <script type="module">
+    import { esc, field } from '/js/ui.js';
+    import { resultCard, thinking, confidenceTag } from '/js/result.js';
+    import { fromCm } from '/shared/units.js';
+    import { FITS, FIT_LABELS, MEASUREMENTS } from '/shared/measurements.js';
+
+    const root = document.getElementById('root');
+    const params = new URLSearchParams(location.search);
+    const merchant = params.get('merchant') ?? '';
+    const product = params.get('product') ?? '';
+    // Only the embedding store's origin receives messages.
+    const parentOrigin = (() => { try { return new URL(params.get('origin') ?? '').origin; } catch { return null; } })();
+    const post = (msg) => { if (parentOrigin && window.parent !== window) window.parent.postMessage({ source: 'mesur', ...msg }, parentOrigin); };
+    const q = `merchant=${encodeURIComponent(merchant)}&product=${encodeURIComponent(product)}`;
+    let fit = null;
+    let selected = null;
+
+    const head = (d) => `<div class="stack" style="--gap:4px;padding-right:36px"><span class="label">${esc(d?.brand?.name ?? 'Mesur')}</span><h1 class="h3">${esc(d?.product?.name ?? 'Find my size')}</h1></div>`;
+    const foot = (extra = '') => `<div class="foot"><span class="powered">Powered by Mesur</span>${extra}</div>`;
+
+    async function api(path, options = {}) {
+      const res = await fetch(path, { credentials: 'same-origin', ...options, headers: { 'Content-Type': 'application/json', ...(options.headers ?? {}) } });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) { const e = new Error(body.error ?? 'Request failed'); e.fields = body.fields; throw e; }
+      return body;
+    }
+
+    function authView(d, mode = 'login', error = '') {
+      root.innerHTML = `${head(d)}
+        <div class="stack" style="--gap:6px"><h2 class="h2" style="font-size:26px">${mode === 'login' ? 'Log in to see your size' : 'Create your size profile'}</h2>
+          <p class="muted small">${mode === 'login' ? 'Your universal size profile works on every participating store.' : 'One profile, every brand. Takes under a minute.'}</p></div>
+        <form class="stack" id="auth" novalidate>
+          ${error ? `<p class="notice bad" role="alert">${esc(error)}</p>` : ''}
+          ${mode === 'signup' ? field('Name', '<input class="input" name="name" autocomplete="name" required>') : ''}
+          ${field('Email', '<input class="input" name="email" type="email" autocomplete="email" required>')}
+          ${field('Password', `<input class="input" name="password" type="password" autocomplete="${mode === 'login' ? 'current-password' : 'new-password'}" required>`)}
+          <button class="btn btn-primary btn-block" type="submit">${mode === 'login' ? 'Log in' : 'Create account'}</button>
+          <button class="link small" type="button" id="switch" style="align-self:center">${mode === 'login' ? 'New here? Create a profile' : 'Already have a profile? Log in'}</button>
+        </form>
+        <p class="small faint">Your measurements are stored by Mesur and never shared with ${esc(d?.brand?.name ?? 'the store')}.</p>
+        ${foot()}`;
+      document.getElementById('switch').onclick = () => authView(d, mode === 'login' ? 'signup' : 'login');
+      document.getElementById('auth').onsubmit = async (e) => {
+        e.preventDefault();
+        const f = Object.fromEntries(new FormData(e.target));
+        const btn = e.target.querySelector('[type=submit]');
+        btn.classList.add('loading');
+        try {
+          await api(`/api/auth/${mode}`, { method: 'POST', body: JSON.stringify(f) });
+          start();
+        } catch (err) { authView(d, mode, err.message); }
+      };
+      root.querySelector('input')?.focus();
+    }
+
+    function profileView(d, error = '') {
+      const keys = ['height', 'chest', 'waist', 'shoulder'];
+      root.innerHTML = `${head(d)}
+        <div class="stack" style="--gap:6px"><h2 class="h2" style="font-size:26px">Add your measurements</h2>
+          <p class="muted small">Height and chest are required. Waist and shoulders make the result more accurate.</p></div>
+        <form class="stack" id="m" novalidate>
+          ${error ? `<p class="notice bad" role="alert">${esc(error)}</p>` : ''}
+          <div class="grid cols-2" style="--gap:12px">${keys.map((k) => field(`${MEASUREMENTS[k].label} (cm)`, `<input class="input" name="${k}" inputmode="decimal" ${MEASUREMENTS[k].required ? 'required' : ''}>`, { optional: !MEASUREMENTS[k].required })).join('')}</div>
+          <button class="btn btn-primary btn-block" type="submit">Save and find my size</button>
+        </form>
+        <p class="small faint">You can add more measurements and switch to inches in your Mesur profile later.</p>
+        ${foot()}`;
+      document.getElementById('m').onsubmit = async (e) => {
+        e.preventDefault();
+        const f = Object.fromEntries(new FormData(e.target));
+        const measurements = Object.fromEntries(Object.entries(f).map(([k, v]) => [k, v.trim() === '' ? null : Number(v.replace(',', '.'))]));
+        try { await api('/api/me/measurements', { method: 'PUT', body: JSON.stringify({ measurements }) }); start(); }
+        catch (err) { profileView(d, err.message); }
+      };
+      root.querySelector('input')?.focus();
+    }
+
+    function readyView(d) {
+      const r = d.result;
+      const unit = d.user.preferredUnit;
+      const sizes = r.sizes ?? [];
+      selected ??= r.size ?? null;
+      const showScore = d.config.showScore;
+      root.innerHTML = `${head(d)}
+        ${resultCard(r, { unit, showScore, caption: 'Based on your universal size profile.' })}
+        <div class="stack" style="--gap:8px"><span class="label">Fit preference</span>
+          <div class="seg" role="group" id="fit">${FITS.map((f) => `<button type="button" data-v="${f}" aria-pressed="${f === d.fitPreference}">${FIT_LABELS[f].replace(' fit', '')}</button>`).join('')}</div></div>
+        ${sizes.length ? `<div class="stack" style="--gap:8px"><span class="label">All sizes${showScore ? ' · match' : ''}</span>
+          <div class="alt">${sizes.map((s) => `<button type="button" class="size-chip ${s.label === r.size ? 'rec' : ''} ${s.label === selected ? 'active' : ''}" data-size="${esc(s.label)}" aria-pressed="${s.label === selected}" title="${esc(s.disqualifiedReason ?? '')}">${esc(s.label)}${showScore ? `&nbsp;<span class="small" style="opacity:.6">${s.matchScore}%</span>` : ''}</button>`).join('')}</div></div>` : ''}
+        ${r.fitNotes?.length ? `<div class="stack" style="--gap:6px">${r.fitNotes.map((n) => `<p class="small muted">${esc(n.text)}</p>`).join('')}</div>` : ''}
+        ${r.status === 'insufficient_data' ? '' : ''}
+        ${foot(`<span class="row" style="--gap:8px"><a class="btn btn-sm" href="/app/profile" target="_blank" rel="noopener">Edit profile</a>${selected && parentOrigin ? `<button class="btn btn-primary btn-sm" id="pick">Select ${esc(selected)}</button>` : ''}</span>`)}`;
+      root.querySelectorAll('[data-add-measurement]').forEach((a) => { a.target = '_blank'; a.rel = 'noopener'; });
+      document.getElementById('fit').onclick = (e) => { const b = e.target.closest('button'); if (b) { fit = b.dataset.v; selected = null; start(); } };
+      root.querySelectorAll('[data-size]').forEach((b) => { b.onclick = () => { selected = b.dataset.size; readyView(d); }; });
+      const pick = document.getElementById('pick');
+      if (pick) pick.onclick = () => post({ type: 'size-selected', size: selected });
+      void confidenceTag; void fromCm;
+    }
+
+    async function start() {
+      root.innerHTML = `${head(null)}${thinking('Finding your size…')}`;
+      try {
+        const [d] = await Promise.all([api(`/api/widget/recommend?${q}${fit ? `&fit=${fit}` : ''}`), new Promise((r) => setTimeout(r, 500))]);
+        if (d.state === 'auth_required') return authView(d);
+        if (d.state === 'no_profile') return profileView(d);
+        if (d.state === 'not_customer') {
+          root.innerHTML = `${head(d)}<div class="empty"><h2 class="h3">Signed in as a ${esc(d.role)}</h2><p>Size recommendations are for shopper accounts. Log out of Mesur and sign in with a customer account to try the widget.</p>
+            <button class="btn btn-sm" id="lo">Log out</button></div>${foot()}`;
+          document.getElementById('lo').onclick = async () => { await api('/api/auth/logout', { method: 'POST', body: '{}' }); start(); };
+          return;
+        }
+        readyView(d);
+      } catch (err) {
+        root.innerHTML = `${head(null)}<div class="empty" role="alert"><h2 class="h3">Size recommendations are unavailable</h2><p>${esc(err.message)}</p><button class="btn btn-sm" id="retry">Try again</button></div>${foot()}`;
+        document.getElementById('retry').onclick = start;
+      }
+    }
+    start();
+  </script>
+</body>
+</html>
